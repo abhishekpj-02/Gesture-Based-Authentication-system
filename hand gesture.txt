@@ -1,0 +1,253 @@
+import cv2
+import mediapipe as mp
+import sqlite3
+import time
+import threading
+import os
+import ttkbootstrap as tb
+from tkinter import ttk
+from tkinter import messagebox
+from PIL import Image, ImageTk
+import itertools
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(min_detection_confidence=0.8, min_tracking_confidence=0.8)
+mp_draw = mp.solutions.drawing_utils
+
+# Database connection with error handling
+def connect_database():
+    try:
+        conn = sqlite3.connect("auth_logs.db", check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS logs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TEXT,
+                            gesture TEXT,
+                            result TEXT)''')
+        conn.commit()
+        return conn, cursor
+    except sqlite3.Error as e:
+        print(f"Database Error: {e}")
+        messagebox.showerror("Database Error", f"Unable to connect to the database: {e}")
+        return None, None
+
+conn, cursor = connect_database()
+
+# OpenCV Video Capture with error handling
+def open_camera():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Unable to open camera")
+        messagebox.showerror("Camera Error", "Unable to access the camera.")
+        return None
+    return cap
+
+cap = open_camera()
+
+# Prevent duplicate logging
+last_logged_gesture = None
+last_logged_time = 0
+cooldown_time = 2
+
+# Animated loading effect
+def animate_logo():
+    animation = itertools.cycle(["|", "/", "-", "\\"])
+    while True:
+        status_label.config(text=f"Waiting for gesture... {next(animation)}")
+        time.sleep(0.3)
+
+# Logging function
+def log_attempt(gesture, result):
+    global last_logged_gesture, last_logged_time
+    
+    current_time = time.time()
+    if gesture != last_logged_gesture or (current_time - last_logged_time > cooldown_time):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("INSERT INTO logs (timestamp, gesture, result) VALUES (?, ?, ?)", (timestamp, gesture, result))
+        conn.commit()
+        
+        last_logged_gesture = gesture
+        last_logged_time = current_time
+
+        status_label.config(text=result, bootstyle="success" if "Successful" in result else "danger")
+        fetch_logs()
+
+# Gesture recognition
+def recognize_gesture(hand_landmarks):
+    """Recognizes gestures based on hand landmarks."""
+    thumb_tip = hand_landmarks.landmark[4]
+    index_tip = hand_landmarks.landmark[8]
+    middle_tip = hand_landmarks.landmark[12]
+    ring_tip = hand_landmarks.landmark[16]
+    pinky_tip = hand_landmarks.landmark[20]
+    
+    # "OK" Gesture
+    if (abs(thumb_tip.x - index_tip.x) < 0.05 and 
+        abs(thumb_tip.y - index_tip.y) < 0.05 and 
+        thumb_tip.y < index_tip.y):  
+        return "OK"
+    
+    # "Fist" Gesture
+    if (index_tip.y > hand_landmarks.landmark[6].y and
+        middle_tip.y > hand_landmarks.landmark[10].y and
+        ring_tip.y > hand_landmarks.landmark[14].y and
+        pinky_tip.y > hand_landmarks.landmark[18].y):
+        return "Fist"
+    
+    # "Peace" Gesture (Index & Middle fingers up, others down)
+    if (index_tip.y < hand_landmarks.landmark[6].y and
+        middle_tip.y < hand_landmarks.landmark[10].y and
+        ring_tip.y > hand_landmarks.landmark[14].y and
+        pinky_tip.y > hand_landmarks.landmark[18].y):
+        return "Peace"
+    
+    # "Open Palm" Gesture (All fingers up)
+    if (index_tip.y < hand_landmarks.landmark[6].y and
+        middle_tip.y < hand_landmarks.landmark[10].y and
+        ring_tip.y < hand_landmarks.landmark[14].y and
+        pinky_tip.y < hand_landmarks.landmark[18].y):
+        return "Open Palm"
+
+    return None
+
+# Update frame function
+def update_frame():
+    ret, frame = cap.read()
+    frame = cv2.flip(frame, 1)
+    if not ret:
+        return
+    
+    start_time = time.time()
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            gesture = recognize_gesture(hand_landmarks)
+            result_text = ""
+            color = (255, 255, 255)
+
+            if gesture == "OK" or gesture == "Peace" or gesture == "Open Palm":
+                result_text = "Authentication Successful"
+                color = (0, 255, 0)
+            elif gesture == "Fist":
+                result_text = "Access Denied"
+                color = (0, 0, 255)
+
+            
+            if gesture:
+                cv2.putText(frame, result_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                log_attempt(gesture, result_text)
+
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img = Image.fromarray(img)
+    imgtk = ImageTk.PhotoImage(image=img)
+    
+    video_label.imgtk = imgtk
+    video_label.configure(image=imgtk)
+    
+    fps = int(1 / (time.time() - start_time))
+    fps_label.config(text=f"FPS: {fps}")
+    
+    video_label.after(10, update_frame)
+
+# Fetch logs dynamically
+def fetch_logs():
+    conn = sqlite3.connect("auth_logs.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM logs ORDER BY id DESC")
+    rows = cursor.fetchall()
+    
+    for row in tree.get_children():
+        tree.delete(row)
+    
+    for row in rows:
+        tree.insert("", "end", values=row)
+    conn.close()
+
+# Clear logs
+def clear_logs():
+    conn = sqlite3.connect("auth_logs.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM logs")
+    cursor.execute("DELETE FROM sqlite_sequence WHERE name='logs'")
+    conn.commit()
+    conn.close()
+    fetch_logs()
+
+# Show tutorial window
+def show_tutorial():
+    tutorial_window = tb.Toplevel(root)
+    tutorial_window.title("Gesture Tutorial")
+    tutorial_window.geometry("600x400")
+    
+    tb.Label(tutorial_window, text="Gesture Tutorial", font=("Arial", 16, "bold")).pack(pady=10)
+    tb.Label(tutorial_window, text="1. OK Gesture: Thumb and index finger touch.\n2. Fist Gesture: Close your fist.\n3. Peace Gesture: Index and middle fingers up.\n4. Open Palm Gesture: All fingers extended.", 
+             font=("Arial", 14), justify="left").pack(pady=20)
+    
+    tb.Button(tutorial_window, text="Close", command=tutorial_window.destroy, bootstyle="primary").pack(pady=10)
+
+# Tkinter GUI setup
+root = tb.Window(themename="superhero")
+root.title("Gesture-Based Authentication")
+root.geometry("1200x700")
+
+# Video Frame
+video_frame = tb.Frame(root)
+video_frame.pack(side="left", padx=10, pady=10)
+
+video_label = tb.Label(video_frame)
+video_label.pack()
+
+fps_label = tb.Label(video_frame, text="FPS: --", font=("Arial", 12))
+fps_label.pack(pady=5)
+
+# Gesture Status Panel
+status_label = tb.Label(root, text="Waiting for gesture...", font=("Arial", 14, "bold"), bootstyle="warning")
+status_label.pack(pady=10)
+
+# Logs Frame
+logs_frame = tb.Frame(root)
+logs_frame.pack(side="right", padx=10, pady=10)
+
+tb.Label(logs_frame, text="Authentication Logs", font=("Arial", 14, "bold")).pack()
+
+# Table
+columns = ("ID", "Timestamp", "Gesture", "Result")
+tree = ttk.Treeview(logs_frame, columns=columns, show="headings")
+
+# Adjust column widths dynamically
+tree.heading("ID", text="ID")
+tree.column("ID", width=40, anchor="center")
+
+tree.heading("Timestamp", text="Timestamp")
+tree.column("Timestamp", width=180, anchor="center")
+
+tree.heading("Gesture", text="Gesture")
+tree.column("Gesture", width=80, anchor="center")
+
+tree.heading("Result", text="Result")
+tree.column("Result", width=200, anchor="center")
+
+tree.pack(expand=True, fill="both")
+# Buttons
+button_frame = tb.Frame(logs_frame)
+button_frame.pack(pady=10)
+
+tb.Button(button_frame, text="Clear Logs", bootstyle="danger", command=clear_logs).pack(side="left", padx=5)
+tb.Button(button_frame, text="Show Tutorial", bootstyle="info", command=show_tutorial).pack(side="left", padx=5)
+
+# Start animations and video capture
+if cap:
+    threading.Thread(target=animate_logo, daemon=True).start()
+    update_frame()
+    fetch_logs()
+root.mainloop()
+
+# Cleanup
+if cap:
+    cap.release()
+cv2.destroyAllWindows()
+conn.close()
